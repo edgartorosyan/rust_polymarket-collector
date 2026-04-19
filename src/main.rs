@@ -52,12 +52,12 @@ async fn main() -> anyhow::Result<()> {
     // RefCells give each closure shared handles to the strategies without
     // requiring Send — try_join! polls both on the same task, so borrow_mut()
     // never panics at runtime.
-    let print_strategy = RefCell::new(PrintStrategy::new());
+    // let print_strategy = RefCell::new(PrintStrategy::new());
     let store_strategy = RefCell::new(StoreStrategy::new("BTC", "15m").await?);
 
     tokio::try_join!(
         chainlink.stream_prices(&["btc/usd"], |tick| {
-            print_strategy.borrow_mut().on_chainlink(&tick);
+            // print_strategy.borrow_mut().on_chainlink(&tick);
             store_strategy.borrow_mut().on_chainlink(&tick);
         }),
         run_updown_monitor(
@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
             "btc",
             15,
             |tick: UpdownTick| {
-                print_strategy.borrow_mut().on_clob(&tick);
+                // print_strategy.borrow_mut().on_clob(&tick);
                 store_strategy.borrow_mut().on_clob(&tick);
             },
             cfg.with_orderbook.then(|| OrderbookHandler {
