@@ -21,3 +21,10 @@ sha2 = "0.10"
 hex = "0.4"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-native-tls", "postgres", "chrono", "uuid"] }
+dotenvy = "0.15"
+envy = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+sysinfo = "0.32"

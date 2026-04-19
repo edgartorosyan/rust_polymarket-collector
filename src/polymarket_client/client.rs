@@ -13,7 +13,9 @@ use super::{
 
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 const GAMMA_BASE_URL: &str = "https://gamma-api.polymarket.com";
+const POLYMARKET_BASE_URL: &str = "https://polymarket.com";
 
+#[derive(Clone)]
 pub struct PolymarketClient {
     http: Client,
     clob_base: String,
@@ -41,6 +43,7 @@ impl PolymarketClient {
     where
         T: serde::de::DeserializeOwned,
     {
+        crate::metrics::record_http_request("polymarket_clob");
         let url = format!("{}{}", self.clob_base, path);
         let resp = self.http.get(&url).query(query).send().await?;
         Self::parse_response(resp).await
@@ -50,6 +53,7 @@ impl PolymarketClient {
     where
         T: serde::de::DeserializeOwned,
     {
+        crate::metrics::record_http_request("polymarket_gamma");
         let url = format!("{}{}", self.gamma_base, path);
         let resp = self.http.get(&url).query(query).send().await?;
         Self::parse_response(resp).await
@@ -225,6 +229,129 @@ impl PolymarketClient {
             self.get_gamma("/events", &[("slug", slug.to_string())]).await?;
         Ok(results.pop())
     }
+
+    // ─── Scrape: Strike Price from Event Page ───────────────────────────
+
+    /// Fetch the Polymarket event page HTML and extract the `priceToBeat`
+    /// value from the embedded `__NEXT_DATA__` JSON payload.
+    ///
+    /// `event_slug` is e.g. `"btc-updown-15m-1775595600"`. The trailing unix
+    /// timestamp is used to disambiguate which `crypto-prices` query to read
+    /// — see [`parse_price_to_beat_from_html`] for why this matters.
+    pub async fn scrape_strike_price(&self, event_slug: &str) -> Result<Option<f64>, PolymarketError> {
+        let expected_start = event_slug
+            .rsplit('-')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok());
+
+        let url = format!("{}/event/{}", POLYMARKET_BASE_URL, event_slug);
+        println!("scraping strike price from: {url}");
+        crate::metrics::record_http_request("polymarket_scrape");
+        let resp = self.http.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(PolymarketError::Api {
+                status: resp.status().as_u16(),
+                message: format!("failed to fetch event page: {url}"),
+            });
+        }
+
+        let html = resp.text().await.map_err(|e| PolymarketError::Deserialize(e.to_string()))?;
+
+        Ok(parse_price_to_beat_from_html(&html, expected_start))
+    }
+}
+
+/// Extract the strike price ("Price To Beat") from `__NEXT_DATA__` in the HTML.
+///
+/// The page embeds dehydrated React Query data. For the **active** market the
+/// strike price lives in the `"crypto-prices"` query as `openPrice`:
+///
+/// ```json
+/// { "queryKey": ["crypto-prices","price","BTC","<start>","fifteen","<end>"],
+///   "state": { "data": { "openPrice": 69988.527, "closePrice": null } } }
+/// ```
+///
+/// The page typically carries **several** `crypto-prices` entries (one per
+/// historical window, used for the chart). At a window rotation the
+/// just-opened window's entry has `openPrice: null` while previous windows
+/// still carry valid numbers — so picking "the first non-null" returns the
+/// *previous* window's strike. `expected_start` (the `<start>` embedded in
+/// the slug) is matched against `queryKey[3]` to select the entry for the
+/// exact window we asked about. Accepts the timestamp as seconds, milliseconds,
+/// or either in string form (Polymarket has shipped all three).
+///
+/// Returns `None` when no matching entry is found. The previous implementation
+/// recursed into `eventMetadata.priceToBeat` as a fallback, but that grabbed
+/// unrelated markets' values out of the same blob and caused wrong strikes at
+/// rotation. Callers should rely on Gamma / Chainlink fallbacks instead.
+fn parse_price_to_beat_from_html(html: &str, expected_start: Option<u64>) -> Option<f64> {
+    let json_str = extract_next_data_json(html)?;
+    let data: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+    let queries = data
+        .pointer("/props/pageProps/dehydratedState/queries")
+        .and_then(|v| v.as_array())?;
+
+    let mut first_fallback: Option<f64> = None;
+
+    for q in queries {
+        let key = match q.get("queryKey").and_then(|k| k.as_array()) {
+            Some(k) => k,
+            None => continue,
+        };
+        if key.first().and_then(|v| v.as_str()) != Some("crypto-prices") {
+            continue;
+        }
+
+        let open_price = q.pointer("/state/data/openPrice").and_then(|v| v.as_f64());
+        let key_start_secs = key.get(3).and_then(parse_ts_any);
+
+        match (expected_start, key_start_secs, open_price) {
+            (Some(expected), Some(k), Some(open)) if k == expected => return Some(open),
+            (None, _, Some(open)) if first_fallback.is_none() => {
+                first_fallback = Some(open);
+            }
+            _ => {}
+        }
+    }
+
+    first_fallback
+}
+
+/// Parse a `queryKey` timestamp cell into unix **seconds**.
+///
+/// Polymarket has shipped this field in at least four shapes across versions:
+/// - JSON number in seconds   (e.g. `1776548700`)
+/// - JSON number in ms        (e.g. `1776548700000`)
+/// - JSON string of either    (`"1776548700"` / `"1776548700000"`)
+/// - RFC 3339 string          (`"2026-04-18T21:45:00Z"` — currently shipped)
+fn parse_ts_any(v: &serde_json::Value) -> Option<u64> {
+    // Any unix value ≥ this is unambiguously milliseconds (would be year 2286 in seconds).
+    const MS_CUTOFF: u64 = 10_000_000_000;
+
+    if let Some(n) = v.as_u64() {
+        return Some(if n >= MS_CUTOFF { n / 1000 } else { n });
+    }
+    if let Some(s) = v.as_str() {
+        if let Ok(n) = s.parse::<u64>() {
+            return Some(if n >= MS_CUTOFF { n / 1000 } else { n });
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Some(dt.timestamp() as u64);
+        }
+    }
+    None
+}
+
+/// Slice out the JSON content of the `<script id="__NEXT_DATA__">` tag.
+fn extract_next_data_json(html: &str) -> Option<&str> {
+    let marker = r#"id="__NEXT_DATA__""#;
+    let after_marker = &html[html.find(marker)?..];
+    let json_start = after_marker.find('>')? + 1;
+    let json_slice = &after_marker[json_start..];
+    let json_end = json_slice.find("</script>")?;
+    Some(&json_slice[..json_end])
 }
 
 impl Default for PolymarketClient {

@@ -125,6 +125,7 @@ impl ChainlinkClient {
         let sig = cl_sign("GET", &path, api_key, api_secret, ts_ms);
         let url = format!("{CL_REST_BASE}{path}");
 
+        crate::metrics::record_http_request("chainlink_rest");
         let json: serde_json::Value = self
             .http
             .get(&url)
@@ -147,6 +148,7 @@ impl ChainlinkClient {
         let url = format!(
             "{BINANCE_BASE}/klines?symbol={symbol}&interval=1m&startTime={start_ms}&limit=1"
         );
+        crate::metrics::record_http_request("binance_rest");
         // Kline response: [[open_time, open, high, low, close, ...]]
         let rows: Vec<Vec<serde_json::Value>> =
             self.http.get(&url).send().await.ok()?.json().await.ok()?;

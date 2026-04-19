@@ -46,8 +46,8 @@ impl PrintStrategy {
     /// Call this for every CLOB price tick.
     pub fn on_clob(&mut self, tick: &UpdownTick) {
         // ── Detect market window rotation ─────────────────────────────────────
-        if tick.up_id != self.last_up_id {
-            self.last_up_id = tick.up_id.clone();
+        if tick.market.up_id != self.last_up_id {
+            self.last_up_id = tick.market.up_id.clone();
             self.up_ask = f64::NAN;
             self.down_ask = f64::NAN;
 
@@ -59,7 +59,7 @@ impl PrintStrategy {
         }
 
         // ── Update Up / Down asks ─────────────────────────────────────────────
-        if tick.inner.asset_id == tick.up_id {
+        if tick.inner.asset_id == tick.market.up_id {
             self.up_ask = tick.inner.best_ask;
         } else {
             self.down_ask = tick.inner.best_ask;
@@ -67,11 +67,11 @@ impl PrintStrategy {
 
         // ── Print ─────────────────────────────────────────────────────────────
         let now = chrono::Utc::now().timestamp() as f64;
-        let secs_left = (tick.end_ts - now).max(0.0) as u64;
+        let secs_left = (tick.market.end_ts - now).max(0.0) as u64;
         let sum = self.up_ask + self.down_ask;
         let chainlink_str = Self::fmt_price(self.chainlink_price);
 
-        let pct_str = match tick.strike_price {
+        let pct_str = match tick.market.strike_price() {
             Some(strike) if self.chainlink_price.is_finite() && self.chainlink_price != 0.0 => {
                 format!("{:+.4}%", (self.chainlink_price - strike) / self.chainlink_price * 100.0)
             }

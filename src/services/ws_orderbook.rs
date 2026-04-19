@@ -9,6 +9,12 @@
 //! - **`price_change`** — incremental update to a single price level; a size
 //!   of `0` means the level was removed.
 //!
+//! Two streamers are exposed:
+//! - [`stream_orderbook`] — perpetual; merges all assets into one callback.
+//! - [`stream_orderbook_until`] — scoped to a single Up/Down market window;
+//!   routes events to separate `on_up` / `on_down` callbacks and exits at the
+//!   window deadline so the caller can rotate to the next market.
+//!
 //! # Usage
 //! ```rust
 //! ws_orderbook::stream_orderbook(&[up_token_id, down_token_id], |ev| {
@@ -219,4 +225,155 @@ fn parse_levels(raw: &[RawLevel]) -> Vec<Level> {
             Some(Level { price, size })
         })
         .collect()
+}
+
+fn raw_to_event(ev: RawEvent) -> Option<OrderbookEvent> {
+    let timestamp_ms = ev
+        .timestamp
+        .as_deref()
+        .and_then(|t| t.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    match ev.event_type.as_str() {
+        "book" => Some(OrderbookEvent::Snapshot(BookSnapshot {
+            asset_id: ev.asset_id,
+            market: ev.market,
+            bids: parse_levels(&ev.bids),
+            asks: parse_levels(&ev.asks),
+            timestamp_ms,
+        })),
+        "price_change" => {
+            let price = ev
+                .price
+                .as_deref()
+                .and_then(|p| p.parse::<f64>().ok())
+                .unwrap_or(f64::NAN);
+            let size = ev
+                .size
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            Some(OrderbookEvent::Update(BookUpdate {
+                asset_id: ev.asset_id,
+                market: ev.market,
+                side: ev.side.unwrap_or_default(),
+                price,
+                size,
+                timestamp_ms,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// CLOB orderbook frames come as a JSON array `[{...}, ...]` for snapshots
+/// and usually a single object `{...}` for `price_change`. Accept both.
+fn parse_orderbook_frame(text: &str) -> Result<Vec<RawEvent>, serde_json::Error> {
+    if text.starts_with('[') {
+        serde_json::from_str::<Vec<RawEvent>>(text)
+    } else {
+        serde_json::from_str::<RawEvent>(text).map(|e| vec![e])
+    }
+}
+
+/// Like [`stream_orderbook`] but scoped to a single Up/Down market window:
+/// routes events to `on_up_orderbook` or `on_down_orderbook` based on
+/// `asset_id`, and exits cleanly once `end_ts_secs` (Unix seconds) is reached.
+///
+/// Use this when monitoring a single updown market so the caller can switch
+/// to the next market without cancelling the whole task.
+pub async fn stream_orderbook_until(
+    up_asset_id: &str,
+    down_asset_id: &str,
+    end_ts_secs: f64,
+    mut on_up_orderbook: impl FnMut(OrderbookEvent),
+    mut on_down_orderbook: impl FnMut(OrderbookEvent),
+) -> anyhow::Result<()> {
+    if up_asset_id.is_empty() || down_asset_id.is_empty() {
+        bail!("up_asset_id and down_asset_id must not be empty");
+    }
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs_f64((end_ts_secs - now_secs).max(0.0));
+
+    let subscribe_msg = serde_json::json!({
+        "auth": {},
+        "markets": [],
+        "assets_ids": [up_asset_id, down_asset_id],
+    })
+    .to_string();
+
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+
+        match connect_async(CLOB_WS_URL).await {
+            Err(e) => {
+                eprintln!("[ws_orderbook] connect error: {e}, retrying in 3s...");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            Ok((mut ws, _)) => {
+                if let Err(e) = ws.send(Message::Text(subscribe_msg.clone().into())).await {
+                    eprintln!("[ws_orderbook] subscribe error: {e}, reconnecting...");
+                    continue;
+                }
+                eprintln!("[ws_orderbook] subscribed to up+down (until expiry)");
+
+                loop {
+                    let raw = tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => {
+                            eprintln!("[ws_orderbook] market deadline reached, closing stream");
+                            let _ = ws.close(None).await;
+                            return Ok(());
+                        }
+                        msg = ws.next() => match msg {
+                            None => break,
+                            Some(m) => m,
+                        }
+                    };
+
+                    let text = match raw {
+                        Ok(Message::Text(t)) => t.to_string(),
+                        Ok(Message::Close(_)) => {
+                            eprintln!("[ws_orderbook] server closed, reconnecting...");
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[ws_orderbook] read error: {e}, reconnecting...");
+                            break;
+                        }
+                        _ => continue,
+                    };
+
+                    let raw_events = match parse_orderbook_frame(&text) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("[ws_orderbook] parse error: {e}\n  raw: {text}");
+                            continue;
+                        }
+                    };
+
+                    for raw_ev in raw_events {
+                        let Some(event) = raw_to_event(raw_ev) else { continue };
+                        let asset_id = match &event {
+                            OrderbookEvent::Snapshot(s) => s.asset_id.as_str(),
+                            OrderbookEvent::Update(u) => u.asset_id.as_str(),
+                        };
+                        if asset_id == up_asset_id {
+                            on_up_orderbook(event);
+                        } else if asset_id == down_asset_id {
+                            on_down_orderbook(event);
+                        }
+                    }
+                }
+
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
 }

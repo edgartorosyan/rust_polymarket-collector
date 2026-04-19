@@ -1,3 +1,11 @@
+//! Wire-format types for the Polymarket CLOB + Gamma REST APIs, plus the
+//! internal `UpdownMarket` summary produced by discovery.
+//!
+//! Gamma returns some numeric fields (`liquidity`, `volume`, `group_line`,
+//! `line`) as either a JSON number or a quoted string depending on the
+//! endpoint / nesting depth — use [`deserialize_opt_f64_or_str`] for any new
+//! `Option<f64>` fields added to [`GammaMarket`].
+
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
