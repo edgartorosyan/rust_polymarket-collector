@@ -7,6 +7,14 @@ use crate::services::market_monitor::UpdownTick;
 /// strike price for the current market window.  On each CLOB tick it prints
 /// a one-liner with all relevant numbers; highlights in red when the combined
 /// ask sum drops below 1.00 (potential edge).
+///
+/// The `pct` column on each line is the signed % distance of the current
+/// coin price from the window's strike: `(coin_price - strike) / strike * 100`.
+/// Positive → price is above the strike (Up is currently winning), negative →
+/// below (Down is currently winning), `0.0000%` → exactly on the line. Prints
+/// `n/a` until both the strike and a Chainlink tick are available. The strike
+/// is the fixed anchor for the window, so the value is symmetric and directly
+/// comparable across ticks within the same window.
 pub struct PrintStrategy {
     /// Latest Chainlink oracle price (price to beat).
     chainlink_price: f64,
@@ -71,9 +79,12 @@ impl PrintStrategy {
         let sum = self.up_ask + self.down_ask;
         let chainlink_str = Self::fmt_price(self.chainlink_price);
 
+        // Signed % distance from strike: > 0 → Up winning, < 0 → Down winning.
+        // Denominator is the strike (fixed for the window), so the value is a
+        // stable reference across ticks and symmetric around the line.
         let pct_str = match tick.market.strike_price() {
-            Some(strike) if self.chainlink_price.is_finite() && self.chainlink_price != 0.0 => {
-                format!("{:+.4}%", (self.chainlink_price - strike) / self.chainlink_price * 100.0)
+            Some(strike) if strike.is_finite() && strike != 0.0 && self.chainlink_price.is_finite() => {
+                format!("{:+.4}%", (self.chainlink_price - strike) / strike * 100.0)
             }
             _ => "n/a".to_string(),
         };

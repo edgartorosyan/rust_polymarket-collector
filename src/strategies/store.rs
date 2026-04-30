@@ -40,6 +40,14 @@ enum StoreEvent {
         coin_price: Option<f64>,
         up: Option<f64>,
         down: Option<f64>,
+        /// Signed % distance of the current coin price from the window's strike,
+        /// computed as `(coin_price - strike) / strike * 100`. Positive means
+        /// price is above the strike (Up is currently winning), negative means
+        /// below (Down is currently winning), `0.0` means exactly on the line.
+        /// `None` while either the strike or the chainlink price is unknown.
+        /// The denominator is the strike (fixed for the window), not the
+        /// moving coin price, so the value is symmetric and stationary across
+        /// ticks within the same window.
         pct: Option<f64>,
         milliseconds_left: i64,
         ts: DateTime<Utc>,
@@ -123,9 +131,12 @@ impl StoreStrategy {
             self.down_ask = tick.inner.best_ask;
         }
 
+        // Signed % distance from strike: > 0 → Up winning, < 0 → Down winning.
+        // Denominator is the strike (fixed for the window), so the value is a
+        // stable reference across ticks and symmetric around the line.
         let pct = match current_strike {
-            Some(strike) if self.chainlink_price.is_finite() && self.chainlink_price != 0.0 => {
-                Some((self.chainlink_price - strike) / self.chainlink_price * 100.0)
+            Some(strike) if strike.is_finite() && strike != 0.0 && self.chainlink_price.is_finite() => {
+                Some((self.chainlink_price - strike) / strike * 100.0)
             }
             _ => None,
         };
